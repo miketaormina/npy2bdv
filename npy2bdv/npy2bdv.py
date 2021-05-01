@@ -3,6 +3,10 @@
 # License: GPL-3.0
 import os
 import h5py
+try:
+    import z5py
+except ModuleNotFoundError:
+    pass
 import numpy as np
 from xml.etree import ElementTree as ET
 import skimage.transform
@@ -23,12 +27,16 @@ class BdvBase:
             filename: string,
                 Path to either .h5 or .xml file. The other file of the pair will be in the same folder.
         """
+        file_type = Path(filename).suffix
+        self.file_type = file_type
+        filename = Path(filename)
         self._fmt = 't{:05d}/s{:02d}/{}'
-        if filename[-2:] == 'h5':
-            self.filename_h5 = filename
-            self.filename_xml = filename[:-2] + 'xml'
-        elif filename[-3:] == 'xml':
-            if os.path.exists(filename):  # if the XML file already exists (editor mode)
+        if file_type == '.h5':
+            self.filename_h5 = str(filename)
+            self.filename_xml = filename.with_suffix('.xml')
+            self.filename_n5 = None
+        elif file_type == '.xml':
+            if filename.exists():  # if the XML file already exists (editor mode)
                 try:
                     et = ET.parse(filename)
                     root = et.getroot()
@@ -36,14 +44,25 @@ class BdvBase:
                     iml = sq.find('ImageLoader')
                     hdf5_ = iml.find('hdf5')
                     image_file_name = hdf5_.text
-                    image_file = Path(filename).parent.joinpath(image_file_name)
-                    self.filename_h5 = image_file
-                    self.filename_xml = filename
+                    image_file = filename.parent.joinpath(image_file_name)
+                    image_file_type = image_file.suffix
+                    if image_file_type == '.h5':
+                        self.filename_h5 = str(image_file)
+                        self.filename_xml = str(filename)
+                        self.filename_n5 = None
+                    elif image_file_type == '.n5':
+                        self.filename_h5 = None
+                        self.filename_xml = str(filename)
+                        self.filename_n5 = str(image_file)
                 except Exception as e:
                     raise ValueError(f"Could no parse XML file {filename}")
             else:  # to create a new file pair H5/XML
-                self.filename_h5 = filename[:-3] + 'h5'
-                self.filename_xml = filename
+                self.filename_h5 = str(filename.with_suffix('h5'))
+                self.filename_xml = str(filename)
+        elif file_type == '.n5':
+            self.filename_n5 = str(filename)
+            self.filename_xml = str(filename.with_suffix('.xml'))
+            self.filename_h5 = None
         self._root = None
         self.nlevels = None
         self.ntimes = self.nilluminations = self.nchannels = self.ntiles = self.nangles = self.nsetups = 0
@@ -195,8 +214,8 @@ class BdvBase:
         """Write resolutions and subdivisions for all setups into h5 file."""
         for isetup in range(self.nsetups):
             group_name = 's{:02d}'.format(isetup)
-            if group_name in self._file_object_h5:
-                grp = self._file_object_h5[group_name]
+            if group_name in self._file_object:
+                grp = self._file_object[group_name]
                 flipped_subsamp = np.flip(self.subsamp, 1)
                 flipped_blockdim = np.flip(self.chunks, 1)
                 res_dataset = grp['resolutions']
@@ -225,7 +244,7 @@ class BdvBase:
         assert len(self.subsamp) == 1, f"Image pyramids already exist, len(self.subsamp) = {len(self.subsamp)}"
         assert len(self.chunks) == 1, f"Image pyramids already exist, len(self.chunks) = {len(self.chunks)}"
         assert self.nsetups > 0, f"Dataset has no views! self.nsetups = {self.nsetups}"
-        assert self._file_object_h5 is not None, "H5 file object (self._file_object_h5) is None!"
+        assert self._file_object is not None, "H5 file object (self._file_object) is None!"
         assert len(self.subsamp) == len(self.chunks), f"Length of subsampling tuple {len(subsamp)} must " \
                                               f"be == length of block dimensions {len(blockdim)}."
         for isub in range(len(subsamp)):
@@ -242,10 +261,10 @@ class BdvBase:
             for isetup in trange(self.nsetups, desc='views'):
                 for ilevel in range(1, self.nlevels):
                     full_res_group_name = self._fmt.format(time, isetup, 0)
-                    if full_res_group_name in self._file_object_h5:
-                        raw_data = self._file_object_h5[full_res_group_name]['cells'][()].astype('uint16')
+                    if full_res_group_name in self._file_object:
+                        raw_data = self._file_object[full_res_group_name]['cells'][()].astype('uint16')
                         pyramid_group_name = self._fmt.format(time, isetup, ilevel)
-                        grp = self._file_object_h5.create_group(pyramid_group_name)
+                        grp = self._file_object.create_group(pyramid_group_name)
                         subdata = self._subsample_stack(raw_data, self.subsamp[ilevel]).astype('int16')
                         grp.create_dataset('cells', data=subdata, chunks=tuple(self.chunks[ilevel]),
                                            maxshape=(None, None, None), compression=self.compression, dtype='int16')
@@ -325,7 +344,10 @@ class BdvWriter(BdvBase):
                 print("Warning: H5 file already exists, overwriting.")
             else:
                 raise FileExistsError(f"File {self.filename_h5} already exists.")
-        self._file_object_h5 = h5py.File(self.filename_h5, 'a')
+        if self.filename_h5 is not None:
+            self._file_object = h5py.File(self.filename_h5, 'a')
+        elif self.filename_n5 is not None:
+            self._file_object = z5py.File(self.filename_n5, use_zarr_format=False)
         self._write_setups_header()
         self.virtual_stacks = False
         self.setup_id_present = [[False] * self.nsetups]
@@ -368,9 +390,9 @@ class BdvWriter(BdvBase):
         """Write resolutions and subdivisions for all setups into h5 file."""
         for isetup in range(self.nsetups):
             group_name = 's{:02d}'.format(isetup)
-            if group_name in self._file_object_h5:
-                del self._file_object_h5[group_name]
-            grp = self._file_object_h5.create_group(group_name)
+            if group_name in self._file_object:
+                del self._file_object[group_name]
+            grp = self._file_object.create_group(group_name)
             data_subsamp = np.flip(self.subsamp, 1)
             data_chunks = np.flip(self.chunks, 1)
             grp.create_dataset('resolutions', data=data_subsamp, dtype='<f8', maxshape=(None, 3))
@@ -405,7 +427,7 @@ class BdvWriter(BdvBase):
                                                  f"virtual stack z-dimension {self.stack_shapes[isetup][0]}."
         for ilevel in range(self.nlevels):
             group_name = self._fmt.format(time, isetup, ilevel)
-            dataset = self._file_object_h5[group_name]["cells"]
+            dataset = self._file_object[group_name]["cells"]
             dataset[z, :, :] = self._subsample_plane(plane, self.subsamp[ilevel]).astype('int16')
 
     def append_substack(self, substack, z_start, y_start=0, x_start=0,
@@ -442,7 +464,7 @@ class BdvWriter(BdvBase):
             f"Substack offset {x_start} + x-dim {substack.shape[2]} > virtual stack x-dim {self.stack_shapes[isetup][2]}."
         for ilevel in range(self.nlevels):
             group_name = self._fmt.format(time, isetup, ilevel)
-            dataset = self._file_object_h5[group_name]["cells"]
+            dataset = self._file_object[group_name]["cells"]
             subdata = self._subsample_stack(substack, self.subsamp[ilevel]).astype('int16')
             dataset[z_start : z_start + substack.shape[0],
                     y_start : y_start + substack.shape[1],
@@ -502,10 +524,10 @@ class BdvWriter(BdvBase):
 
         for ilevel in range(self.nlevels):
             group_name = self._fmt.format(time, isetup, ilevel)
-            if group_name in self._file_object_h5:
+            if group_name in self._file_object:
                 print(f"Overwriting H5 group {group_name}")
-                del self._file_object_h5[group_name]
-            grp = self._file_object_h5.create_group(group_name)
+                del self._file_object[group_name]
+            grp = self._file_object.create_group(group_name)
             if stack is not None:
                 subdata = self._subsample_stack(stack, self.subsamp[ilevel]).astype('int16')
                 grp.create_dataset('cells', data=subdata, chunks=self.chunks[ilevel],
@@ -675,8 +697,8 @@ class BdvWriter(BdvBase):
 
     def close(self):
         """Save changes and close the H5 file."""
-        self._file_object_h5.flush()
-        self._file_object_h5.close()
+        self._file_object.flush()
+        self._file_object.close()
 
 
 class BdvEditor(BdvBase):
@@ -696,7 +718,7 @@ class BdvEditor(BdvBase):
         super().__init__(filename)
         assert os.path.exists(self.filename_h5), f"Error: {self.filename_h5} file not found"
         assert os.path.exists(self.filename_xml), f"Error: {self.filename_xml} file not found"
-        self._file_object_h5 = h5py.File(self.filename_h5, 'r+')
+        self._file_object = h5py.File(self.filename_h5, 'r+')
         self._root = None
         self.ntimes, self.nilluminations, self.nchannels, self.ntiles, self.nangles = self.get_attribute_count()
         self.nsetups = self.nilluminations * self.nchannels * self.ntiles * self.nangles
@@ -738,8 +760,8 @@ class BdvEditor(BdvBase):
             dataset: numpy array (dim=3, dtype=uint16)"""
         isetup = self._determine_setup_id(illumination, channel, tile, angle)
         group_name = self._fmt.format(time, isetup, ilevel)
-        if self._file_object_h5:
-            dataset = self._file_object_h5[group_name]["cells"][()].astype('uint16')
+        if self._file_object:
+            dataset = self._file_object[group_name]["cells"][()].astype('uint16')
             return dataset
         else:
             raise ValueError('File object is None')
@@ -760,10 +782,10 @@ class BdvEditor(BdvBase):
                 Level of subsampling, if available (default 0, no subsampling)
         """
         isetup = self._determine_setup_id(illumination, channel, tile, angle)
-        if self._file_object_h5:
+        if self._file_object:
             for time in range(self.ntimes):
                 group_name = self._fmt.format(time, isetup, ilevel)
-                view_dataset = self._file_object_h5[group_name]["cells"]
+                view_dataset = self._file_object[group_name]["cells"]
                 view_arr = view_dataset[()]
                 if bbox_xyz[0]:
                     view_arr = view_arr[:, :, slice(*bbox_xyz[0])]
@@ -773,7 +795,7 @@ class BdvEditor(BdvBase):
                     view_arr = view_arr[slice(*bbox_xyz[2]), :, :]
                 view_dataset.resize(view_arr.shape)
                 view_dataset[:] = view_arr # Always use braces here! A common mistake to omit them.
-                self._file_object_h5.flush()
+                self._file_object.flush()
         else:
             raise FileNotFoundError(self.filename_h5)
         # Edit the XML file as well.
@@ -820,8 +842,8 @@ class BdvEditor(BdvBase):
 
     def finalize(self):
         """Finalize the H5 and XML files: save changes and close them."""
-        if self._file_object_h5 is not None:
-            self._file_object_h5.close()
+        if self._file_object is not None:
+            self._file_object.close()
         if self._root is not None:
             self._xml_indent(self._root)
             tree = ET.ElementTree(self._root)
